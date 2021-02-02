@@ -226,6 +226,9 @@ status_t Parcel::flattenBinder(const sp<IBinder>& binder)
             if (local->isRequestingSid()) {
                 obj.flags |= FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
             }
+            if (local->isInheritRt()) {
+                obj.flags |= FLAT_BINDER_FLAG_INHERIT_RT;
+            }
             obj.hdr.type = BINDER_TYPE_BINDER;
             obj.binder = reinterpret_cast<uintptr_t>(local->getWeakRefs());
             obj.cookie = reinterpret_cast<uintptr_t>(local);
@@ -528,14 +531,19 @@ constexpr int32_t kHeader = B_PACK_CHARS('S', 'Y', 'S', 'T');
 // Write RPC headers.  (previously just the interface token)
 status_t Parcel::writeInterfaceToken(const String16& interface)
 {
+    return writeInterfaceToken(interface.string(), interface.size());
+}
+
+status_t Parcel::writeInterfaceToken(const char16_t* str, size_t len) {
     const IPCThreadState* threadState = IPCThreadState::self();
     writeInt32(threadState->getStrictModePolicy() | STRICT_MODE_PENALTY_GATHER);
     updateWorkSourceRequestHeaderPosition();
     writeInt32(threadState->shouldPropagateWorkSource() ?
             threadState->getCallingWorkSourceUid() : IPCThreadState::kUnsetWorkSource);
     writeInt32(kHeader);
+
     // currently the interface identification token is just its name as a string
-    return writeString16(interface);
+    return writeString16(str, len);
 }
 
 bool Parcel::replaceCallingWorkSourceUid(uid_t uid)

@@ -438,6 +438,9 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
     property_get("debug.sf.disable_client_composition_cache", value, "0");
     mDisableClientCompositionCache = atoi(value);
 
+    property_get("ro.sf.force_light_brightness", value, "0");
+    mForceLightBrightness = atoi(value);
+
     // We should be reading 'persist.sys.sf.color_saturation' here
     // but since /data may be encrypted, we need to wait until after vold
     // comes online to attempt to read the property. The property is
@@ -608,13 +611,6 @@ void SurfaceFlinger::bootFinished()
     if (mWindowManager != 0) {
         mWindowManager->linkToDeath(static_cast<IBinder::DeathRecipient*>(this));
     }
-    sp<IBinder> input(defaultServiceManager()->getService(
-            String16("inputflinger")));
-    if (input == nullptr) {
-        ALOGE("Failed to link to input service");
-    } else {
-        mInputFlinger = interface_cast<IInputFlinger>(input);
-    }
 
     if (mVrFlinger) {
       mVrFlinger->OnBootFinished();
@@ -629,7 +625,15 @@ void SurfaceFlinger::bootFinished()
     LOG_EVENT_LONG(LOGTAG_SF_STOP_BOOTANIM,
                    ns2ms(systemTime(SYSTEM_TIME_MONOTONIC)));
 
-    static_cast<void>(schedule([this] {
+    sp<IBinder> input(defaultServiceManager()->getService(String16("inputflinger")));
+
+    static_cast<void>(schedule([=] {
+        if (input == nullptr) {
+            ALOGE("Failed to link to input service");
+        } else {
+            mInputFlinger = interface_cast<IInputFlinger>(input);
+        }
+
         readPersistentProperties();
         mPowerAdvisor.onBootFinished();
         mBootStage = BootStage::FINISHED;
@@ -1514,6 +1518,10 @@ status_t SurfaceFlinger::getDisplayBrightnessSupport(const sp<IBinder>& displayT
     const auto displayId = getPhysicalDisplayIdLocked(displayToken);
     if (!displayId) {
         return NAME_NOT_FOUND;
+    }
+    if (mForceLightBrightness) {
+        *outSupport = false;
+        return NO_ERROR;
     }
     *outSupport =
             getHwComposer().hasDisplayCapability(*displayId, hal::DisplayCapability::BRIGHTNESS);
@@ -4532,12 +4540,9 @@ void SurfaceFlinger::recordBufferingStats(const std::string& layerName,
 
 void SurfaceFlinger::dumpFrameEventsLocked(std::string& result) {
     result.append("Layer frame timestamps:\n");
-
-    const LayerVector& currentLayers = mCurrentState.layersSortedByZ;
-    const size_t count = currentLayers.size();
-    for (size_t i=0 ; i<count ; i++) {
-        currentLayers[i]->dumpFrameEvents(result);
-    }
+    // Traverse all layers to dump frame-events for each layer
+    mCurrentState.traverseInZOrder(
+        [&] (Layer* layer) { layer->dumpFrameEvents(result); });
 }
 
 void SurfaceFlinger::dumpBufferingStats(std::string& result) const {

@@ -482,6 +482,33 @@ void InputDispatcher::dispatchOnce() {
 }
 
 /**
+ * Raise ANR if there is no focused window.
+ * Before the ANR is raised, do a final state check:
+ * 1. The currently focused application must be the same one we are waiting for.
+ * 2. Ensure we still don't have a focused window.
+ */
+void InputDispatcher::processNoFocusedWindowAnrLocked() {
+    // Check if the application that we are waiting for is still focused.
+    sp<InputApplicationHandle> focusedApplication =
+            getValueByKey(mFocusedApplicationHandlesByDisplay, mAwaitedApplicationDisplayId);
+    if (focusedApplication == nullptr ||
+        focusedApplication->getApplicationToken() !=
+                mAwaitedFocusedApplication->getApplicationToken()) {
+        // Unexpected because we should have reset the ANR timer when focused application changed
+        ALOGE("Waited for a focused window, but focused application has already changed to %s",
+              focusedApplication->getName().c_str());
+        return; // The focused application has changed.
+    }
+
+    const sp<InputWindowHandle>& focusedWindowHandle =
+            getFocusedWindowHandleLocked(mAwaitedApplicationDisplayId);
+    if (focusedWindowHandle != nullptr) {
+        return; // We now have a focused window. No need for ANR.
+    }
+    onAnrLocked(mAwaitedFocusedApplication);
+}
+
+/**
  * Check if any of the connections' wait queues have events that are too old.
  * If we waited for events to be ack'ed for more than the window timeout, raise an ANR.
  * Return the time at which we should wake up next.
@@ -492,8 +519,9 @@ nsecs_t InputDispatcher::processAnrsLocked() {
     // Check if we are waiting for a focused window to appear. Raise ANR if waited too long
     if (mNoFocusedWindowTimeoutTime.has_value() && mAwaitedFocusedApplication != nullptr) {
         if (currentTime >= *mNoFocusedWindowTimeoutTime) {
-            onAnrLocked(mAwaitedFocusedApplication);
+            processNoFocusedWindowAnrLocked();
             mAwaitedFocusedApplication.clear();
+            mNoFocusedWindowTimeoutTime = std::nullopt;
             return LONG_LONG_MIN;
         } else {
             // Keep waiting
@@ -518,7 +546,7 @@ nsecs_t InputDispatcher::processAnrsLocked() {
     connection->responsive = false;
     // Stop waking up for this unresponsive connection
     mAnrTracker.eraseToken(connection->inputChannel->getConnectionToken());
-    onAnrLocked(connection);
+    onAnrLocked(*connection);
     return LONG_LONG_MIN;
 }
 
@@ -1472,6 +1500,35 @@ int32_t InputDispatcher::findFocusedWindowTargetsLocked(nsecs_t currentTime,
               EventEntry::typeToString(entry.type), displayId);
             }
         return INPUT_EVENT_INJECTION_FAILED;
+    }
+
+    // Compatibility behavior: raise ANR if there is a focused application, but no focused window.
+    // Only start counting when we have a focused event to dispatch. The ANR is canceled if we
+    // start interacting with another application via touch (app switch). This code can be removed
+    // if the "no focused window ANR" is moved to the policy. Input doesn't know whether
+    // an app is expected to have a focused window.
+    if (focusedWindowHandle == nullptr && focusedApplicationHandle != nullptr) {
+        if (!mNoFocusedWindowTimeoutTime.has_value()) {
+            // We just discovered that there's no focused window. Start the ANR timer
+            const nsecs_t timeout = focusedApplicationHandle->getDispatchingTimeout(
+                    DEFAULT_INPUT_DISPATCHING_TIMEOUT.count());
+            mNoFocusedWindowTimeoutTime = currentTime + timeout;
+            mAwaitedFocusedApplication = focusedApplicationHandle;
+            mAwaitedApplicationDisplayId = displayId;
+            ALOGW("Waiting because no window has focus but %s may eventually add a "
+                  "window when it finishes starting up. Will wait for %" PRId64 "ms",
+                  mAwaitedFocusedApplication->getName().c_str(), ns2ms(timeout));
+            *nextWakeupTime = *mNoFocusedWindowTimeoutTime;
+            return INPUT_EVENT_INJECTION_PENDING;
+        } else if (currentTime > *mNoFocusedWindowTimeoutTime) {
+            // Already raised ANR. Drop the event
+            ALOGE("Dropping %s event because there is no focused window",
+                  EventEntry::typeToString(entry.type));
+            return INPUT_EVENT_INJECTION_FAILED;
+        } else {
+            // Still waiting for the focused window
+            return INPUT_EVENT_INJECTION_PENDING;
+        }
     }
 
     // we have a valid, non-null focused window
@@ -3548,6 +3605,10 @@ std::vector<sp<InputWindowHandle>> InputDispatcher::getWindowHandlesLocked(
     return getValueByKey(mWindowHandlesByDisplay, displayId);
 }
 
+sp<InputWindowHandle> InputDispatcher::getFocusedWindowHandleLocked(int displayId) const {
+    return getValueByKey(mFocusedWindowHandlesByDisplay, displayId);
+}
+
 sp<InputWindowHandle> InputDispatcher::getWindowHandleLocked(
         const sp<IBinder>& windowHandleToken) const {
     if (windowHandleToken == nullptr) {
@@ -3726,6 +3787,7 @@ void InputDispatcher::setInputWindowsLocked(
                       newFocusedWindowHandle->getName().c_str(), displayId);
             }
             mFocusedWindowHandlesByDisplay[displayId] = newFocusedWindowHandle;
+	    resetNoFocusedWindowTimeoutLocked();
             enqueueFocusEventLocked(*newFocusedWindowHandle, true /*hasFocus*/);
         }
 
@@ -4523,12 +4585,12 @@ void InputDispatcher::onFocusChangedLocked(const sp<InputWindowHandle>& oldFocus
     postCommandLocked(std::move(commandEntry));
 }
 
-void InputDispatcher::onAnrLocked(const sp<Connection>& connection) {
+void InputDispatcher::onAnrLocked(const Connection& connection) {
     // Since we are allowing the policy to extend the timeout, maybe the waitQueue
     // is already healthy again. Don't raise ANR in this situation
-    if (connection->waitQueue.empty()) {
+    if (connection.waitQueue.empty()) {
         ALOGI("Not raising ANR because the connection %s has recovered",
-              connection->inputChannel->getName().c_str());
+              connection.inputChannel->getName().c_str());
         return;
     }
     /**
@@ -4539,21 +4601,21 @@ void InputDispatcher::onAnrLocked(const sp<Connection>& connection) {
      * processes the events linearly. So providing information about the oldest entry seems to be
      * most useful.
      */
-    DispatchEntry* oldestEntry = *connection->waitQueue.begin();
+    DispatchEntry* oldestEntry = *connection.waitQueue.begin();
     const nsecs_t currentWait = now() - oldestEntry->deliveryTime;
     std::string reason =
             android::base::StringPrintf("%s is not responding. Waited %" PRId64 "ms for %s",
-                                        connection->inputChannel->getName().c_str(),
+                                        connection.inputChannel->getName().c_str(),
                                         ns2ms(currentWait),
                                         oldestEntry->eventEntry->getDescription().c_str());
 
-    updateLastAnrStateLocked(getWindowHandleLocked(connection->inputChannel->getConnectionToken()),
+    updateLastAnrStateLocked(getWindowHandleLocked(connection.inputChannel->getConnectionToken()),
                              reason);
 
     std::unique_ptr<CommandEntry> commandEntry =
             std::make_unique<CommandEntry>(&InputDispatcher::doNotifyAnrLockedInterruptible);
     commandEntry->inputApplicationHandle = nullptr;
-    commandEntry->inputChannel = connection->inputChannel;
+    commandEntry->inputChannel = connection.inputChannel;
     commandEntry->reason = std::move(reason);
     postCommandLocked(std::move(commandEntry));
 }
@@ -4653,15 +4715,15 @@ void InputDispatcher::doNotifyAnrLockedInterruptible(CommandEntry* commandEntry)
 void InputDispatcher::extendAnrTimeoutsLocked(const sp<InputApplicationHandle>& application,
                                               const sp<IBinder>& connectionToken,
                                               nsecs_t timeoutExtension) {
+    if (connectionToken == nullptr && application != nullptr) {
+        // The ANR happened because there's no focused window
+        mNoFocusedWindowTimeoutTime = now() + timeoutExtension;
+        mAwaitedFocusedApplication = application;
+    }
+
     sp<Connection> connection = getConnectionLocked(connectionToken);
     if (connection == nullptr) {
-        if (mNoFocusedWindowTimeoutTime.has_value() && application != nullptr) {
-            // Maybe ANR happened because there's no focused window?
-            mNoFocusedWindowTimeoutTime = now() + timeoutExtension;
-            mAwaitedFocusedApplication = application;
-        } else {
-            // It's also possible that the connection already disappeared. No action necessary.
-        }
+        // It's possible that the connection already disappeared. No action necessary.
         return;
     }
 
